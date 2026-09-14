@@ -27,6 +27,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Tuple
 from urllib.parse import urlparse
 
+from primes_in_range import get_primes
+
 
 class Registry:
     def __init__(self, ttl_s: int = 3600):
@@ -86,6 +88,62 @@ def split_into_slices(low: int, high: int, n: int) -> List[Tuple[int, int]]:
             out.append((start, end))
         start = end
     return out
+
+"""
+
+this fallback function will compute the number of primes on the local primary node if the secondary nodes fail. this function just calls get prime with the upper and lower bound without splitting into slices for the distributed approach
+
+"""
+def compute_local_fallback(
+    sl: Tuple[int, int],
+    *,
+    mode: str,
+    max_return_primes: int,
+    failed_node: Dict[str, Any] | None = None,
+    failure: Exception | None = None,
+) -> Dict[str, Any]:
+    """Compute a failed secondary slice directly on the primary."""
+    low, high = sl
+    t0 = time.perf_counter()
+    max_prime = -1
+    primes_truncated = False
+
+    if mode == "count":
+        total_primes = int(get_primes(low, high, return_list=False))
+        primes: List[int] | None = None
+    else:
+        all_primes = list(get_primes(low, high, return_list=True))
+        total_primes = len(all_primes)
+        max_prime = all_primes[-1] if all_primes else -1
+        primes = all_primes[:max_return_primes]
+        primes_truncated = len(all_primes) > max_return_primes
+
+    elapsed_s = time.perf_counter() - t0
+    failed_node_id = failed_node.get("node_id") if failed_node else None
+    result: Dict[str, Any] = {
+        "node_id": "primary-fallback",
+        "node": {"host": "local", "port": None, "cpu_count": 1},
+        "slice": [low, high],
+        "round_trip_s": 0.0,
+        "node_elapsed_s": elapsed_s,
+        "node_sum_chunk_s": elapsed_s,
+        "total_primes": total_primes,
+        "max_prime": max_prime,
+        "primes": primes,
+        "primes_truncated": primes_truncated,
+        "fallback": True,
+        "failed_node_id": failed_node_id,
+    }
+    if failure is not None:
+        result["failure"] = str(failure)
+
+    fallback_reason = (
+        f"after secondary {failed_node_id} failed"
+        if failed_node_id
+        else "because no secondary was available"
+    )
+    print(f"[primary_node] Local fallback completed slice [{low}, {high}) {fallback_reason}")
+    return result
 
 
 def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -166,10 +224,45 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
             "primes_truncated": bool(resp.get("primes_truncated", False)),
         }
 
-    with ThreadPoolExecutor(max_workers=min(32, len(nodes_sorted))) as ex:
-        futs = [ex.submit(call_node, node, sl) for node, sl in zip(nodes_sorted, slices)]
-        for f in as_completed(futs):
-            per_node_results.append(f.result())
+    failed_secondaries: List[Dict[str, Any]] = []
+    if nodes_sorted:
+        with ThreadPoolExecutor(max_workers=min(32, len(nodes_sorted))) as ex:
+            futures = {
+                ex.submit(call_node, node, sl): (node, sl)
+                for node, sl in zip(nodes_sorted, slices)
+            }
+            for future in as_completed(futures):
+                node, sl = futures[future]
+                try:
+                    per_node_results.append(future.result())
+                except Exception as exc:
+                    failed_secondaries.append({
+                        "node_id": node["node_id"],
+                        "slice": list(sl),
+                        "error": str(exc),
+                    })
+                    print(
+                        f"[primary_node] Secondary {node['node_id']} failed for "
+                        f"slice [{sl[0]}, {sl[1]}): {exc}"
+                    )
+                    per_node_results.append(
+                        compute_local_fallback(
+                            sl,
+                            mode=mode,
+                            max_return_primes=max_return_primes,
+                            failed_node=node,
+                            failure=exc,
+                        )
+                    )
+    else:
+        print("[primary_node] No active secondary nodes; computing request locally")
+        per_node_results.append(
+            compute_local_fallback(
+                (low, high),
+                mode=mode,
+                max_return_primes=max_return_primes,
+            )
+        )
 
     per_node_results.sort(key=lambda r: r["slice"][0])
 
@@ -195,6 +288,10 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
         "mode": mode,
         "range": [low, high],
         "nodes_used": len(nodes_sorted),
+        "nodes_succeeded": len(nodes_sorted) - len(failed_secondaries),
+        "fallback_used": any(bool(r.get("fallback")) for r in per_node_results),
+        "fallback_slices": sum(bool(r.get("fallback")) for r in per_node_results),
+        "failed_secondaries": failed_secondaries,
         "secondary_exec": sec_exec,
         "secondary_workers": sec_workers,
         "chunk": chunk,
