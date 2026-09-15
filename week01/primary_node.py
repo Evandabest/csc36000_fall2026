@@ -165,11 +165,61 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
             "primes": resp.get("primes", None),
             "primes_truncated": bool(resp.get("primes_truncated", False)),
         }
+    # Original code
+    # with ThreadPoolExecutor(max_workers=min(32, len(nodes_sorted))) as ex:
+    #     futs = [ex.submit(call_node, node, sl) for node, sl in zip(nodes_sorted, slices)]
+    #     for f in as_completed(futs):
+    #         per_node_results.append(f.result())
+    
+    # The HW #1
+    failed_slices: List[Tuple[int, int]] = []
+    working_nodes = list(nodes_sorted)
 
-    with ThreadPoolExecutor(max_workers=min(32, len(nodes_sorted))) as ex:
-        futs = [ex.submit(call_node, node, sl) for node, sl in zip(nodes_sorted, slices)]
-        for f in as_completed(futs):
-            per_node_results.append(f.result())
+    # 1) When running tasks concurrently, but catsh the exceptions if a worker crashes
+
+    with ThreadPoolExecutor(max_workers=min(32, len(working_nodes))) as ex:
+        fut_map = {
+            ex.submit(call_node, node, sl): (node,sl)
+            for node, sl in zip(nodes_sorted, slices)
+        }
+
+        for f in as_completed(fut_map):
+            node, sl = fut_map[f]
+            try:
+                per_node_results.append(f.result())
+            except Exception as e:
+                node_id = node["node_id"]
+                print(f"[primary_node] Node {node_id} failed for slice {sl}: {e}")
+
+
+                # 2) Evict the failed node and save the slice for retrying with another node
+                REGISTRY.remove(node_id)
+                if node in working_nodes:
+                    working_nodes.remove(node)
+                failed_slices.append(sl)
+
+    #3) Retry the failed slices with the remaining working nodes
+    for sl in failed_slices:
+        recovered = False
+        for node in working_nodes[:]:
+            try:
+                print(f"[primary_node] Retrying slice {sl} with node {node['node_id']}")
+                res = call_node(node, sl)
+                per_node_results.append(res)
+                recovered = True
+                break
+            except Exception as e:
+                node_id = node["node_id"]
+                print(f"[primary_node] Node {node_id} failed again: {e}")
+                REGISTRY.remove(node_id)
+                working_nodes.remove(node)
+
+        if not recovered:
+            raise RuntimeError(f"Failed to compute slice {sl} after retrying with all available nodes.")
+
+
+# end of HW #1
+
 
     per_node_results.sort(key=lambda r: r["slice"][0])
 
