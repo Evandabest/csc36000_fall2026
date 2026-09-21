@@ -59,6 +59,11 @@ class Registry:
                 del self.nodes[nid]
             return list(self.nodes.values())
 
+    def remove(self, node_id: str) -> None:
+        """Remove a node that has failed so it is not reused."""
+        with self.lock:
+            self.nodes.pop(str(node_id), None)
+
 
 REGISTRY = Registry(ttl_s=120)
 
@@ -144,7 +149,8 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
         req = {k: v for k, v in req.items() if v is not None}
 
         t_call0 = time.perf_counter()
-        resp = _post_json(url, req, timeout_s=3600)
+        timeout_s = int(payload.get("secondary_timeout", 5))
+        resp = _post_json(url, req, timeout_s=timeout_s)
         t_call1 = time.perf_counter()
 
         if not resp.get("ok"):
@@ -166,9 +172,38 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
             "primes_truncated": bool(resp.get("primes_truncated", False)),
         }
 
+    # Failure-tolerant execution. If a secondary node fails, its slice is
+    # reassigned to another healthy node instead of failing the whole request.
+    healthy_nodes = list(nodes_sorted)
+    failed_nodes: List[str] = []
+
+    def run_slice_with_failover(sl: Tuple[int, int], preferred_node: Dict[str, Any]) -> Dict[str, Any]:
+        candidates = [preferred_node] + [n for n in healthy_nodes if n["node_id"] != preferred_node["node_id"]]
+        last_error: Exception | None = None
+
+        for node in candidates:
+            if node["node_id"] in failed_nodes:
+                continue
+            try:
+                return call_node(node, sl)
+            except Exception as e:
+                last_error = e
+                node_id = str(node["node_id"])
+                print(f"[primary_node] Secondary node {node_id} failed for slice {sl}: {e}")
+                print(f"[primary_node] Marking {node_id} unavailable and reassigning slice {sl}.")
+                failed_nodes.append(node_id)
+                REGISTRY.remove(node_id)
+
+        raise RuntimeError(
+            f"all secondary nodes failed while processing slice {sl}; last error: {last_error}"
+        )
+
     with ThreadPoolExecutor(max_workers=min(32, len(nodes_sorted))) as ex:
-        futs = [ex.submit(call_node, node, sl) for node, sl in zip(nodes_sorted, slices)]
-        for f in as_completed(futs):
+        future_to_slice = {
+            ex.submit(run_slice_with_failover, sl, node): sl
+            for node, sl in zip(nodes_sorted, slices)
+        }
+        for f in as_completed(future_to_slice):
             per_node_results.append(f.result())
 
     per_node_results.sort(key=lambda r: r["slice"][0])
@@ -194,7 +229,8 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
         "ok": True,
         "mode": mode,
         "range": [low, high],
-        "nodes_used": len(nodes_sorted),
+        "nodes_used": len({r["node_id"] for r in per_node_results}),
+        "failed_nodes": failed_nodes,
         "secondary_exec": sec_exec,
         "secondary_workers": sec_workers,
         "chunk": chunk,
