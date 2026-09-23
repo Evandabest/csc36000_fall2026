@@ -59,6 +59,11 @@ class Registry:
                 del self.nodes[nid]
             return list(self.nodes.values())
 
+# HW #1: Implement the remove method to evict a node from the registry
+    def remove(self, node_id: str) -> None:
+          with self.lock:
+              self.nodes.pop(node_id, None)
+
 
 REGISTRY = Registry(ttl_s=120)
 
