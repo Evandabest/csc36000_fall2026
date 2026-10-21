@@ -58,6 +58,17 @@ class Registry:
             for nid in stale:
                 del self.nodes[nid]
             return list(self.nodes.values())
+        
+    """
+    Remove method to allow for the immediate removal of a node from the registry that failed prior during computation. 
+    The method takes a node_id as input and removes the corresponding node from the registry if it exists.
+    This helps prevent a a request being made to a known failed node. 
+
+    """    
+    def remove(self, node_id: str) -> None:
+
+        with self.lock:
+            self.nodes.pop(str(node_id), None)
 
 
 REGISTRY = Registry(ttl_s=120)
@@ -166,10 +177,54 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
             "primes_truncated": bool(resp.get("primes_truncated", False)),
         }
 
+    """
+    Send slices concurrently to secondary nodes. 
+    If a node fails, remove it from the registry and reassign the slice.
+    If no active nodes can complete a failed slice, raise a RuntimeError.
+    """
+
+    failed_slices:List[Tuple[int, int]] = []
+
     with ThreadPoolExecutor(max_workers=min(32, len(nodes_sorted))) as ex:
-        futs = [ex.submit(call_node, node, sl) for node, sl in zip(nodes_sorted, slices)]
+        futs = {
+            ex.submit(call_node, node, sl): (node, sl)
+            for node, sl in zip(nodes_sorted, slices)
+        }
+
         for f in as_completed(futs):
-            per_node_results.append(f.result())
+            node, sl = futs[f]
+            try:
+                per_node_results.append(f.result())
+            except Exception as e:
+            
+                node_id = str(node["node_id"])
+                REGISTRY.remove(node_id)
+                failed_slices.append(sl)
+                print(f"[primary_node] Node {node_id} failed for slice {sl}: {e}")
+
+  
+    survivors = REGISTRY.active_nodes()
+
+    for sl in failed_slices:
+        recovered = False
+
+        for node in survivors[:]:
+            try:
+                per_node_results.append(call_node(node, sl))
+                print(f"[primary_node] Reassigned slice {sl} to {node['node_id']}")
+                recovered = True
+                break
+            except Exception as e:
+                node_id = str(node["node_id"])
+                REGISTRY.remove(node_id)
+                survivors.remove(node)
+                print(f"[primary_node] Retry on node {node_id} failed: {e}")
+
+        if not recovered:
+            raise RuntimeError(
+                f"unable to compute slice {sl}: no secondary nodes are available"
+            )
+    
 
     per_node_results.sort(key=lambda r: r["slice"][0])
 
