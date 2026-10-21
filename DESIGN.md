@@ -1,6 +1,8 @@
 # Design: key/value platform
 
-Group: to be confirmed by the team.
+Group: Yasmin Guerra Flores, Evan Haque, Karl Savinskiy, and Atif Tausif.
+
+Instructor: Kurt Brown.
 
 This is a shared draft. Karl's request-routing section is complete. Other members must add their roster details, plugin designs, tradeoffs, and demos before the group submits this document.
 
@@ -9,10 +11,11 @@ This is a shared draft. Karl's request-routing section is complete. Other member
 | Student name | CUNY alias | Plugin filename | Feature branch |
 | --- | --- | --- | --- |
 | Karl Savinskiy | ksavins000 | request_routing.py | ksavins000-request_routing |
-| Min (full name pending) | Pending | write_completion.py | Pending |
-| Evan (details pending) | Pending | Pending | Pending |
+| Yasmin Guerra Flores (Min) | yguerra001 | write_completion.py | Pending |
+| Evan Haque | Pending | Pending | Pending |
+| Atif Tausif | atausif000 | Pending | Pending |
 
-The team must confirm the remaining members and their plugin choices. Min's claim is based on the group discussion; their design section is still pending.
+Evan and Atif still need to confirm their plugin choices and feature branches. Evan's CUNY alias is also pending. Yasmin's write-completion claim is based on the group discussion. Each teammate must add their own design section.
 
 ## Platform reminder
 
