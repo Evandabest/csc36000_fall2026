@@ -28,6 +28,15 @@ from typing import Any, Dict, List, Tuple
 from urllib.parse import urlparse
 
 
+class ComputeUnavailableError(Exception):
+    """Raised when a job cannot be fully computed because no nodes are
+    available or one or more assigned slices failed."""
+
+    def __init__(self, message: str, unfinished_ranges: List[Dict[str, Any]]):
+        super().__init__(message)
+        self.unfinished_ranges = unfinished_ranges
+
+
 class Registry:
     def __init__(self, ttl_s: int = 3600):
         self.ttl_s = ttl_s
@@ -111,7 +120,10 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     nodes = REGISTRY.active_nodes()
     if not nodes:
-        raise ValueError("no active secondary nodes registered")
+        raise ComputeUnavailableError(
+            "no active secondary nodes registered",
+            unfinished_ranges=[{"range": [low, high], "error": "no active secondary nodes registered"}],
+        )
     
     chunk = int(payload.get("chunk", 500_000))
 
@@ -144,12 +156,14 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
         req = {k: v for k, v in req.items() if v is not None}
 
         t_call0 = time.perf_counter()
-        resp = _post_json(url, req, timeout_s=3600)
+        try:
+            resp = _post_json(url, req, timeout_s=3600)
+            if not resp.get("ok"):
+                raise RuntimeError(f"node {node['node_id']} error: {resp}")
+        except Exception as e:
+            return {"failed": True, "slice": list(sl), "error": str(e)}
         t_call1 = time.perf_counter()
 
-        if not resp.get("ok"):
-            raise RuntimeError(f"node {node['node_id']} error: {resp}")
-        
         node_elapsed_s = float(resp.get("elapsed_seconds", 0.0))
         print(f"Node ID: {node['node_id']} completed in: {node_elapsed_s}")
 
@@ -170,6 +184,13 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
         futs = [ex.submit(call_node, node, sl) for node, sl in zip(nodes_sorted, slices)]
         for f in as_completed(futs):
             per_node_results.append(f.result())
+
+    failed = [r for r in per_node_results if r.get("failed")]
+    if failed:
+        raise ComputeUnavailableError(
+            f"{len(failed)} of {len(nodes_sorted)} node(s) failed to compute their slice",
+            unfinished_ranges=[{"range": list(r["slice"]), "error": r["error"]} for r in failed],
+        )
 
     per_node_results.sort(key=lambda r: r["slice"][0])
 
@@ -265,6 +286,11 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError(f"missing field: {k}")
                 resp = distributed_compute(payload)
                 return self._send_json(resp, code=200)
+            except ComputeUnavailableError as e:
+                return self._send_json(
+                    {"ok": False, "error": str(e), "unfinished_ranges": list(e.unfinished_ranges)},
+                    code=503,
+                )
             except Exception as e:
                 return self._send_json({"ok": False, "error": str(e)}, code=400)
 
